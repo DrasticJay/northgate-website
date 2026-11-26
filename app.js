@@ -10,6 +10,7 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const app = $('#app');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const okIdent = s => typeof s === 'string' && /^[A-Za-z0-9-]{6,80}$/.test(s);
 const money = n => Number(n) === 0 ? 'Free' : new Intl.NumberFormat('en-GB', { style: 'currency', currency: C.currency }).format(n);
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const ls = {
@@ -57,10 +58,26 @@ const ic = (n, s = 18, w = 1.8) => `<svg width="${s}" height="${s}" viewBox="0 0
 
 // ------------------------------------------------------------------ data
 let products = [], byId = {}, ready = false;
-async function load() {
-  const r = await fetch(`${API}/accounts/${C.token}/categories?includePackages=1`);
+// Tebex is reachable from this browser (some ad blockers and Edge "Strict" tracking prevention block it)
+let live = false;
+const STORE = 'https://northgate-studios.tebex.store';
+function timed(url, ms) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
+  return fetch(url, { signal: ctl.signal, credentials: 'omit' }).finally(() => clearTimeout(t));
+}
+async function catalogue() {
+  // 1) live prices straight from Tebex
+  try {
+    const r = await timed(`${API}/accounts/${C.token}/categories?includePackages=1`, 6000);
+    if (r.ok) { const j = await r.json(); if (j && Array.isArray(j.data)) { live = true; return j; } }
+  } catch (e) { /* blocked or offline: use the copy on this site */ }
+  // 2) the copy kept on this site (refreshed automatically from Tebex), so the store never breaks
+  const r = await timed('store.json?v=' + Math.floor(Date.now() / 6e5), 8000);
   if (!r.ok) throw new Error('store ' + r.status);
-  const j = await r.json();
+  return r.json();
+}
+async function load() {
+  const j = await catalogue();
   products = (j.data || []).flatMap(c => (c.packages || []).map(p => ({ ...p, catName: c.name, d: D.products[p.id] || {} })));
   const order = Object.keys(D.products).map(Number);
   products.sort((a, b) => (order.indexOf(a.id) + 1 || 99) - (order.indexOf(b.id) + 1 || 99));
@@ -96,7 +113,7 @@ function clean(html) {
   doc.body.querySelectorAll('*').forEach(el => {
     if (!ok.has(el.tagName)) { el.replaceWith(...el.childNodes); return; }
     [...el.attributes].forEach(a => { if (!(el.tagName === 'A' && a.name === 'href' && /^https?:/i.test(a.value))) el.removeAttribute(a.name); });
-    if (el.tagName === 'A') { el.target = '_blank'; el.rel = 'noopener'; }
+    if (el.tagName === 'A') { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
   });
   return doc.body.firstChild.innerHTML;
 }
@@ -132,6 +149,17 @@ function renderBag() {
     + (sugg.length ? `<div class="sugg"><h4>Works well with what you picked</h4>${sugg.map(p => `
     <div class="item"><img src="${esc(imgs(p)[0])}" alt=""><div><b>${esc(p.name)}</b><span>${money(p.total_price)}</span></div><button class="txtbtn mint" data-add="${p.id}" data-keep="1">Add</button></div>`).join('')}</div>` : '')
     : `<div class="empty">${ic('bag', 34, 1.4)}<p>Your basket is empty.</p><a class="btn sm" href="#store">Browse the scripts</a></div>`;
+  if (items.length && !live) {
+    // This browser blocks the Tebex API (ad blocker / strict tracking prevention): finish on our Tebex store instead
+    $('#bagFoot').innerHTML = `
+    <div class="tot"><span>Total</span><b>${money(total)}</b></div>
+    ${items.length === 1 ? `<button class="btn p wide" id="checkout">${ic('lock', 16, 2)} Check out securely</button>` : `
+    <p class="small">Add each script to your basket on our Tebex store, then check out there:</p>
+    ${items.map(p => `<a class="btn wide sm" target="_blank" rel="noopener noreferrer" href="${STORE}/checkout/packages/add/${p.id}/single">${ic('bag', 14, 2)} Add ${esc(title(p))}</a>`).join('')}
+    <a class="btn p wide" href="${STORE}/checkout/basket" target="_blank" rel="noopener noreferrer">${ic('lock', 16, 2)} Check out on Tebex</a>`}
+    <ol class="how"><li>Pay on Tebex by card, PayPal and more. Tebex asks you to sign in with Cfx.re.</li><li>Download from the Cfx.re Portal, under Granted Assets.</li></ol>`;
+    return;
+  }
   $('#bagFoot').innerHTML = items.length ? `
     <div class="tot"><span>Total</span><b>${money(total)}</b></div>
     <button class="btn p wide" id="checkout">${ic('lock', 16, 2)} Check out securely</button>
@@ -141,7 +169,7 @@ function renderBag() {
 // ------------------------------------------------------------------ checkout through Tebex
 const here = () => location.origin + location.pathname;
 async function api(path, opts) {
-  const r = await fetch(API + path, Object.assign({ headers: { 'Content-Type': 'application/json', Accept: 'application/json' } }, opts));
+  const r = await fetch(API + path, Object.assign({ credentials: 'omit', headers: { 'Content-Type': 'application/json', Accept: 'application/json' } }, opts));
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.detail || j.message || j.title || ('Tebex error ' + r.status));
   return j;
@@ -152,6 +180,7 @@ const idle = () => $('#overlay').classList.remove('on');
 // Signing in creates a Tebex basket and sends you to Cfx.re. When you come back we read your Cfx.re name from it,
 // and checkout reuses that basket so you don't sign in twice.
 let account = ls.get('ng_account', null);
+if (!account || !okIdent(account.ident) || typeof account.username !== 'string') account = null;
 function accountUI() {
   const b = $('#loginBtn'); if (!b) return;
   if (account && account.username) {
@@ -166,6 +195,7 @@ function accountUI() {
   const m = $('#acctMenu'); if (m) m.classList.add('hide');
 }
 async function login(next) {
+  if (!live) { toast('Your browser is blocking sign-in here. You can still buy: checkout takes you to our Tebex store.', true); return; }
   busy('Taking you to sign in with Cfx.re…');
   try {
     const b = await api(`/accounts/${C.token}/baskets`, { method: 'POST', body: JSON.stringify({ complete_url: here() + '#thanks', cancel_url: here() + '#store', complete_auto_redirect: true }) });
@@ -175,12 +205,13 @@ async function login(next) {
     const list = Array.isArray(auth) ? auth : (auth.data || []);
     const cfx = list.find(a => /fivem|cfx/i.test(a.name)) || list[0];
     if (!cfx || !cfx.url) throw new Error('no sign-in link');
-    location.href = cfx.url;
+    goSafe(cfx.url);
   } catch (e) { idle(); ls.del('ng_login'); toast('Sign in couldn\'t start: ' + e.message, true); }
 }
 async function loginReturn() {
   const ident = new URLSearchParams(location.search).get('nglogin');
   if (!ident) return false;
+  if (!okIdent(ident)) { history.replaceState(null, '', here() + '#home'); return false; }
   const pend = ls.get('ng_login', null);
   ls.del('ng_login');
   history.replaceState(null, '', here() + ((pend && pend.next) || '#home'));
@@ -211,9 +242,21 @@ async function usableBasket() {
   } catch (e) { return null; }
 }
 
+// Only ever send people to Cfx.re or Tebex pages from data that came back from the Tebex API
+function safeUrl(u) {
+  try { const x = new URL(u); return x.protocol === 'https:' && /(^|\.)(tebex\.io|tebex\.store|cfx\.re)$/i.test(x.hostname) ? x.href : null; }
+  catch (e) { return null; }
+}
+const goSafe = u => { const ok = safeUrl(u); if (!ok) throw new Error('unexpected link'); location.href = ok; };
+// Browser blocks the Tebex API: finish on our Tebex store (normal page loads are never blocked)
+function storeCheckout(ids) {
+  busy('Taking you to our secure Tebex store…');
+  location.href = ids.length === 1 ? `${STORE}/checkout/packages/add/${encodeURIComponent(ids[0])}/single` : STORE;
+}
 async function checkout() {
   const ids = bag.filter(id => byId[id]);
   if (!ids.length) return;
+  if (!live) return storeCheckout(ids);
   busy('Getting your basket ready…');
   const ready = await usableBasket();
   if (ready) return finish(ready, ids);
@@ -226,8 +269,12 @@ async function checkout() {
     const cfx = list.find(a => /fivem|cfx/i.test(a.name)) || list[0];
     if (!cfx || !cfx.url) return finish(ident, ids);
     busy('Taking you to sign in with Cfx.re…');
-    location.href = cfx.url;
-  } catch (e) { idle(); toast('Checkout couldn\'t start: ' + e.message, true); }
+    goSafe(cfx.url);
+  } catch (e) {
+    idle();
+    if (e instanceof TypeError) { live = false; return storeCheckout(ids); }   // network blocked mid-way
+    toast('Checkout couldn\'t start: ' + e.message, true);
+  }
 }
 async function finish(ident, ids) {
   busy('Adding your scripts…');
@@ -241,7 +288,7 @@ async function finish(ident, ids) {
     const url = b.data && b.data.links && b.data.links.checkout;
     if (!url) throw new Error('no checkout link');
     busy('Taking you to secure checkout…');
-    location.href = url;
+    goSafe(url);
   } catch (e) {
     idle(); ls.del('ng_checkout');
     toast('Checkout failed: ' + e.message + '. Please try again.', true);
@@ -251,6 +298,7 @@ async function finish(ident, ids) {
 function resume() {
   const ident = new URLSearchParams(location.search).get('ngbasket');
   if (!ident) return false;
+  if (!okIdent(ident)) { history.replaceState(null, '', here() + '#store'); return false; }
   const pend = ls.get('ng_checkout', null);
   if (!pend || pend.ident !== ident || Date.now() - pend.at > 3600e3) { history.replaceState(null, '', here() + '#store'); return false; }
   finish(ident, pend.ids);
@@ -365,7 +413,7 @@ const head = (h, p, right = '') => `<div class="shead"><div><h2>${h}</h2>${p ? `
 const chead = (eb, h, p) => `<div class="chead">${eb}<h2>${h}</h2>${p ? `<p>${p}</p>` : ''}</div>`;
 const cta = () => `<section class="wrap"><div class="cta">
   <div><h2>Join the <em>Northgate</em> Discord</h2><p>Setup help, release notes and first looks at what's coming. Ask anything before you buy.</p></div>
-  <a class="btn p" href="${DISCORD}" target="_blank" rel="noopener">${ic('chat', 18, 2)} Join the Discord</a></div></section>`;
+  <a class="btn p" href="${DISCORD}" target="_blank" rel="noopener noreferrer">${ic('chat', 18, 2)} Join the Discord</a></div></section>`;
 
 // ------------------------------------------------------------------ home
 const orderList = () => { const o = (C.hotbar || []).map(id => byId[id]).filter(Boolean); return o.length === products.length ? o : products; };
@@ -694,7 +742,7 @@ function viewDocs() {
       <p>Start your framework, database and inventory first, then the Northgate scripts. Scripts that use each other go after the one they use, for example Robberies after Police.</p>
       ${code('server.cfg', 'ensure oxmysql\nensure ox_lib\nensure qbx_core        # or qb-core / es_extended\nensure ox_inventory\n\nensure ng_hud\nensure ng_admin\nensure ng_keys\nensure ng_garages\nensure ng_vehicleshop\nensure ng_police\nensure ng_robberies\nensure ng_mechanic\nensure ng_housing')}
       <h2 id="s-portal">Downloading your scripts</h2>
-      <ol><li>Go to <a class="mint" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener">the Cfx.re Portal, Granted Assets</a>.</li><li>Download the latest version of each script.</li><li>Your server must use a license key from the <b>same Cfx.re account</b>, otherwise the protected files won't load.</li></ol>
+      <ol><li>Go to <a class="mint" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener noreferrer">the Cfx.re Portal, Granted Assets</a>.</li><li>Download the latest version of each script.</li><li>Your server must use a license key from the <b>same Cfx.re account</b>, otherwise the protected files won't load.</li></ol>
       ${products.map(p => `<h2 id="s-p${p.id}">${esc(p.name)}</h2>
         <p>${esc(p.d.intro || '')}</p><h3>Install</h3><ol>${(p.d.install || []).map(s => `<li>${esc(s)}</li>`).join('')}</ol>
         ${p.d.requires ? `<h3>Requirements</h3><ul>${p.d.requires.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
@@ -715,8 +763,8 @@ const TROUBLE = [
 const viewSupport = () => `<div class="wrap page"><h1 class="disp">Support</h1>
   <p class="lede">Help with setup, bugs and questions comes from the people who wrote the scripts. The fastest way is a ticket on our Discord.</p>
   <div class="facts three">
-    <div>${ic('chat', 26)}<h3>Open a ticket</h3><p>Join the Discord and open a ticket. Tell us the script, your framework and any console errors.</p><a class="btn p sm" href="${DISCORD}" target="_blank" rel="noopener">Open Discord</a></div>
-    <div>${ic('bag', 26)}<h3>Find your purchase</h3><p>Everything you've bought is in the Cfx.re Portal under Granted Assets, on the account you signed in with at checkout.</p><a class="btn ghost sm" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener">Open the Cfx.re Portal</a></div>
+    <div>${ic('chat', 26)}<h3>Open a ticket</h3><p>Join the Discord and open a ticket. Tell us the script, your framework and any console errors.</p><a class="btn p sm" href="${DISCORD}" target="_blank" rel="noopener noreferrer">Open Discord</a></div>
+    <div>${ic('bag', 26)}<h3>Find your purchase</h3><p>Everything you've bought is in the Cfx.re Portal under Granted Assets, on the account you signed in with at checkout.</p><a class="btn ghost sm" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener noreferrer">Open the Cfx.re Portal</a></div>
     <div>${ic('settings', 26)}<h3>Read the docs</h3><p>Install steps, start order, commands and owner access for every script, in one place.</p><a class="btn ghost sm" href="#docs">Open the docs</a></div>
   </div>
   <h2 class="disp sm">Common problems</h2><div class="faq">${TROUBLE.map(faqItem).join('')}</div>
@@ -755,7 +803,7 @@ const viewTerms = () => `<div class="wrap page"><h1 class="disp">Terms of sale</
   </div></div>`;
 const viewThanks = () => `<div class="wrap page thanks"><h1 class="disp">Thank you</h1>
   <p class="lede">Your scripts are on their way to your Cfx.re account. Download them from the Cfx.re Portal under Granted Assets, then follow the install steps in the docs.</p>
-  <div class="btns"><a class="btn p" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener">Open my assets</a><a class="btn ghost" href="#docs">Install guide</a><a class="btn ghost" href="${DISCORD}" target="_blank" rel="noopener">Get support</a></div></div>`;
+  <div class="btns"><a class="btn p" href="https://portal.cfx.re/assets/granted-assets" target="_blank" rel="noopener noreferrer">Open my assets</a><a class="btn ghost" href="#docs">Install guide</a><a class="btn ghost" href="${DISCORD}" target="_blank" rel="noopener noreferrer">Get support</a></div></div>`;
 
 // ------------------------------------------------------------------ search
 function openSearch(on) {

@@ -514,3 +514,4 @@ mark{background:rgba(124,245,210,.22);color:var(--text);border-radius:3px}
 .pgal .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
 .pgal .shots button{border-radius:12px}
 .pgal .shots img{aspect-ratio:16/10;object-fit:cover;height:100%;display:block}
+.dfoot .btn.wide+.btn.wide,.dfoot .btn.wide+.btn.p{margin-top:8px}
